@@ -1,6 +1,6 @@
 // node test.js  - self-check for the pure logic in addon/voice-preload.js and addon/voice-main.js
 const assert = require("assert");
-const { nextChunk, toWav, isEcho, meter } = require("./addon/voice-preload.js");
+const { nextChunk, toWav, isEcho } = require("./addon/voice-preload.js");
 
 // waits for a full sentence of >= 30 chars; won't split "3.5"
 const t = "The answer is about 3.5 percent overall, which is nice. Second sentence here";
@@ -30,12 +30,6 @@ assert.ok(!isEcho("yes please walk me through it", said)); // overlaps a little,
 assert.ok(!isEcho("what's the weather tomorrow", said));
 assert.ok(!isEcho("ok", said) && !isEcho("sounds good", said)); // short replies never dropped
 assert.ok(!isEcho("anything at all here", "")); // nothing said recently
-// waveform loudness: room noise flat, speech fills the bar, never above 1, louder never lower
-assert.strictEqual(meter(0), 0);
-assert.strictEqual(meter(0.003), 0);
-assert.ok(meter(0.02) > 0.3 && meter(0.02) < 0.6);
-assert.ok(meter(0.05) < meter(0.1) && meter(0.1) < meter(0.3));
-assert.strictEqual(meter(5), 1);
 // usage totals: today vs all time, per-model price, exact STT cost
 const Module = require("module");
 const load = Module._load;

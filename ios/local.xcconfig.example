@@ -1,0 +1,2 @@
+// Copy to local.xcconfig (git-ignored) and put your own Apple team ID here, then run: xcodegen generate
+DEVELOPMENT_TEAM = YOURTEAMID

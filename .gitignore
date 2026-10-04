@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+samples/
+*.jsonl
+.os3-voice.json
+ios/OS3Voice.xcodeproj/
+ios/build/
+ios/DerivedData/
+*.xcuserstate
+xcuserdata/
+ios/local.xcconfig

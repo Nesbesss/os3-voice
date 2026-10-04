@@ -24,6 +24,11 @@
         return h.filter((w) => r.has(w)).length / h.length >= 0.75;
     }
 
+    // Loudness (RMS, 0..1) -> bar height 0..1 for the live waveform. Quiet room noise stays flat; speech fills most of the bar.
+    function meter(rms) {
+        return rms < 0.004 ? 0 : Math.min(1, Math.pow(rms * 6, 0.55));
+    }
+
     // 16 kHz mono float32 -> 16-bit PCM WAV bytes.
     function toWav(f) {
         const n = f.length, b = new DataView(new ArrayBuffer(44 + n * 2));
@@ -37,7 +42,7 @@
     }
 
     if (typeof document === "undefined") {
-        module.exports = { nextChunk, toWav, isEcho }; // node self-check (test.js)
+        module.exports = { nextChunk, toWav, isEcho, meter }; // node self-check (test.js)
         return;
     }
 
@@ -50,6 +55,7 @@
     const FRAME = 2048, RATE = 16000, FRAME_MS = (FRAME / RATE) * 1000;
     let C = { thresh: 0.02, end_silence_ms: 900, max_chars: 700, barge_in: false, tail_ms: 700 };
     let on = false, stream, ctxIn, proc, pre = [], utt = null, silent = 0;
+    let micAn, outAn, playingNow = 0;
     let ctxOut, epoch = 0, chain = Promise.resolve(), inflight = 0, playing = null, lastPlayEnd = 0, loud = 0, spoken = [];
     let tracked = new Map(), seen = new Set(), timer;
     const loadCfg = () => invoke("os3:voice:cfg").then((c) => { C = { ...C, ...c }; return c; });
@@ -147,8 +153,10 @@ hr{border:0;border-top:1px solid var(--border,#888);margin:6px 4px;opacity:.5}`;
         return ctxOut.decodeAudioData(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength));
     }
     const play = (buf) => new Promise((res) => {
+        if (!outAn) { outAn = ctxOut.createAnalyser(); outAn.fftSize = 1024; outAn.connect(ctxOut.destination); }
         const s = (playing = ctxOut.createBufferSource());
-        s.buffer = buf; s.connect(ctxOut.destination); s.onended = res; s.start();
+        s.buffer = buf; s.connect(outAn); s.onended = () => { playingNow--; res(); };
+        playingNow++; s.start(); wakeWave();
     });
     function say(text) {
         const mine = epoch, pending = invoke("os3:voice:tts", text); // fetch starts now, playback stays in order
@@ -257,16 +265,76 @@ hr{border:0;border-top:1px solid var(--border,#888);margin:6px 4px;opacity:.5}`;
         proc = ctxIn.createScriptProcessor(FRAME, 1, 1);
         proc.onaudioprocess = (e) => onFrame(new Float32Array(e.inputBuffer.getChannelData(0)));
         src.connect(proc); proc.connect(ctxIn.destination);
+        micAn = ctxIn.createAnalyser(); micAn.fftSize = 1024; src.connect(micAn); // loudness for the live waveform
         // replies that exist right now are history, only speak ones that arrive from here on
         seen = new Set([...document.querySelectorAll(SEL)].map(keyOf)); tracked = new Map();
         timer = setInterval(tick, 250);
         loadCfg().catch(() => {});
-        on = true; setState("listening");
+        on = true; setState("listening"); wakeWave();
     }
     function stop() {
         on = false; clearInterval(timer); shutUp();
         try { proc.disconnect(); ctxIn.close(); stream.getTracks().forEach((t) => t.stop()); } catch {}
         pre = []; utt = null; setState("off");
+    }
+
+    // ---------- live waveform in the message bar ----------
+    // Bars scroll left as new loudness arrives: your microphone while you talk, the agent's voice while it speaks.
+    const cv = document.createElement("canvas");
+    cv.id = "os3-voice-wave";
+    cv.style.cssText = "position:fixed;z-index:250;pointer-events:none;display:none";
+    const BAR = 3, GAP = 3, STEP_MS = 33;
+    const STATE_COLOR = { listening: ["--green", "#008754"], hearing: ["--red", "#c1121c"], thinking: ["--yellow", "#f9a800"], speaking: ["--blue", "#007cb0"], error: ["--red", "#c1121c"] };
+    const buf1 = new Float32Array(1024);
+    let hist = [], raf = 0, lastStep = 0, smooth = 0, colorAt = 0, color = "#888";
+    function rmsOf(an) {
+        an.getFloatTimeDomainData(buf1);
+        let s = 0; for (let i = 0; i < buf1.length; i++) s += buf1[i] * buf1[i];
+        return Math.sqrt(s / buf1.length);
+    }
+    function wakeWave() { if (!raf) raf = requestAnimationFrame(frame); }
+    function frame(t) {
+        raf = 0;
+        const ta = document.querySelector("textarea.composer-input");
+        if (!(on || playingNow > 0) || !ta) { cv.style.display = "none"; hist = []; return; }
+        raf = requestAnimationFrame(frame);
+        if (!cv.isConnected) document.body.appendChild(cv);
+        const r = ta.getBoundingClientRect();
+        // typing: get out of the way
+        if (document.activeElement === ta || ta.value || r.width < 80 || r.height < 10) { cv.style.display = "none"; return; }
+        const dpr = devicePixelRatio || 1, w = Math.round(r.width), h = Math.round(Math.max(r.height, 44));
+        if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+        cv.style.cssText = `position:fixed;z-index:250;pointer-events:none;display:block;left:${r.left}px;top:${r.top + r.height / 2 - h / 2}px;width:${w}px;height:${h}px`;
+        if (t - colorAt > (playingNow > 0 ? 200 : 1000)) { // theme can change (light/dark): re-read the page's colours now and then
+            colorAt = t;
+            const [v, fb] = STATE_COLOR[playingNow > 0 ? "speaking" : btn.dataset.state] || ["--control-icon", "#888"];
+            color = getComputedStyle(document.documentElement).getPropertyValue(v).trim() || fb;
+        }
+        if (t - lastStep >= STEP_MS) {
+            lastStep = t;
+            const st = btn.dataset.state;
+            let lvl = 0;
+            if (playingNow > 0 && outAn) lvl = meter(rmsOf(outAn));
+            else if ((st === "listening" || st === "hearing") && micAn) lvl = meter(rmsOf(micAn));
+            else if (st === "thinking") lvl = 0.12 + 0.08 * Math.sin(t / 180); // waiting: a gentle ripple
+            smooth = lvl > smooth ? lvl : smooth * 0.55 + lvl * 0.45; // quick attack, soft release
+            hist.push(smooth);
+            if (hist.length > 400) hist.splice(0, hist.length - 400);
+        }
+        const g = cv.getContext("2d");
+        g.setTransform(dpr, 0, 0, dpr, 0, 0);
+        g.clearRect(0, 0, w, h);
+        const n = Math.floor((w - GAP) / (BAR + GAP)), mid = h / 2;
+        g.fillStyle = color;
+        for (let i = 0; i < n; i++) {
+            const v = hist[hist.length - n + i] ?? 0;
+            const bh = Math.max(3, v * (h - 8));
+            g.globalAlpha = 0.35 + 0.65 * (i / n); // older bars fade out to the left
+            g.beginPath();
+            g.roundRect(GAP + i * (BAR + GAP), mid - bh / 2, BAR, bh, BAR / 2);
+            g.fill();
+        }
+        g.globalAlpha = 1;
     }
 
     // ---------- Settings > Voice ----------
